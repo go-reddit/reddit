@@ -67,6 +67,15 @@ type Post struct {
 	Over18      bool    `json:"over_18"`
 	Stickied    bool    `json:"stickied"`
 	Flair       string  `json:"link_flair_text"`
+	// Media fields. Reddit exposes a post's image(s)/video through several shapes;
+	// the Images / VideoURL accessors (see media.go) resolve them uniformly.
+	PostHint      string                   `json:"post_hint"` // "image","hosted:video","rich:video","link",…
+	IsVideo       bool                     `json:"is_video"`
+	IsGallery     bool                     `json:"is_gallery"`
+	Preview       postPreview              `json:"preview"`
+	GalleryData   galleryData              `json:"gallery_data"`
+	MediaMetadata map[string]mediaMetaItem `json:"media_metadata"`
+	Media         postMedia                `json:"media"`
 }
 
 // Created returns the post's creation time in UTC.
