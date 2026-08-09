@@ -43,6 +43,10 @@ type Client struct {
 	baseURL   string
 	userAgent string
 	auth      *oauthConfig // nil => anonymous ".json" access
+	// sessionCookie is a ready-to-send Cookie header value carrying the user's
+	// logged-in reddit_session cookie. When non-empty it authenticates reads in
+	// place of OAuth (see [WithSessionCookie]); it takes precedence over auth.
+	sessionCookie string
 }
 
 // Option customises a [Client] at construction time.
@@ -121,7 +125,13 @@ func (c *Client) get(ctx context.Context, path string, v any) error {
 	}
 	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Accept", "application/json")
-	if c.auth != nil {
+	// A configured session cookie authenticates the request and takes
+	// precedence over OAuth: send it as-is and add no Bearer. Otherwise fall
+	// back to the OAuth bearer when credentials are configured.
+	switch {
+	case c.sessionCookie != "":
+		req.Header.Set("Cookie", c.sessionCookie)
+	case c.auth != nil:
 		tok, err := c.auth.ensureToken(ctx, c)
 		if err != nil {
 			return err

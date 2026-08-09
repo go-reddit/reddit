@@ -66,6 +66,45 @@ func WithOAuthScript(clientID, clientSecret, username, password string) Option {
 	}
 }
 
+// WithSessionCookie authenticates reads with a logged-in browser's
+// reddit_session cookie instead of OAuth. Reddit's self-serve OAuth
+// registration is effectively closed to new personal projects, so supplying the
+// cookie from an already-signed-in browser is the practical path for
+// individual, read-only use.
+//
+// The argument may be either the bare reddit_session value or a full
+// "reddit_session=…; other=…" Cookie header string; both normalise to a Cookie
+// header value (a bare value is wrapped as "reddit_session=<value>"; a string
+// that already contains "name=value" pairs is used verbatim). Surrounding
+// whitespace is trimmed and an empty (or whitespace-only) argument is ignored.
+//
+// Unlike [WithOAuth], this keeps the default www base URL — the cookie
+// authenticates the same anonymous ".json" endpoints. When both a session
+// cookie and OAuth are configured, the session cookie takes precedence: the
+// request carries the Cookie header and no Bearer token.
+func WithSessionCookie(cookie string) Option {
+	return func(c *Client) {
+		if v := normalizeCookie(cookie); v != "" {
+			c.sessionCookie = v
+		}
+	}
+}
+
+// normalizeCookie converts a bare reddit_session value or a full Cookie header
+// string into a ready-to-send Cookie header value. An argument that already
+// contains a "name=value" pair is assumed to be a full cookie string and kept
+// verbatim; anything else is treated as the bare value and wrapped.
+func normalizeCookie(cookie string) string {
+	cookie = strings.TrimSpace(cookie)
+	if cookie == "" {
+		return ""
+	}
+	if strings.Contains(cookie, "=") {
+		return cookie
+	}
+	return "reddit_session=" + cookie
+}
+
 // tokenResponse is Reddit's /access_token JSON reply.
 type tokenResponse struct {
 	AccessToken string `json:"access_token"`
