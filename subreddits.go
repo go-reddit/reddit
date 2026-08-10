@@ -37,6 +37,20 @@ type subredditThing struct {
 	} `json:"data"`
 }
 
+// info flattens a t5 envelope into the public SubredditInfo shape.
+func (t subredditThing) info() SubredditInfo {
+	d := t.Data
+	return SubredditInfo{
+		Name:              d.DisplayName,
+		Title:             d.Title,
+		PublicDescription: d.PublicDescription,
+		Subscribers:       d.Subscribers,
+		Over18:            d.Over18,
+		URL:               d.URL,
+		Type:              d.SubredditType,
+	}
+}
+
 // subredditListing is the top-level Listing envelope for a page of subreddits.
 type subredditListing struct {
 	Data struct {
@@ -87,16 +101,49 @@ func (c *Client) SearchSubreddits(ctx context.Context, query string, opts Listin
 		if ch.Kind != "t5" {
 			continue // skip anything that is not a subreddit
 		}
-		d := ch.Data
-		page.Subreddits = append(page.Subreddits, SubredditInfo{
-			Name:              d.DisplayName,
-			Title:             d.Title,
-			PublicDescription: d.PublicDescription,
-			Subscribers:       d.Subscribers,
-			Over18:            d.Over18,
-			URL:               d.URL,
-			Type:              d.SubredditType,
-		})
+		page.Subreddits = append(page.Subreddits, ch.info())
 	}
 	return page, nil
+}
+
+// mySubredditsMaxPages bounds MySubreddits' pagination so a misbehaving endpoint
+// that always returns a non-empty After cannot loop forever; 100 pages of 100
+// covers ~10k subscriptions, far beyond any real account.
+const mySubredditsMaxPages = 100
+
+// MySubreddits fetches every subreddit the authenticated user is subscribed to,
+// paging through Reddit's /subreddits/mine/subscriber listing until it is
+// exhausted, so a reader can import a logged-in account's subscriptions in one
+// call. Authentication is required — a session cookie (see [WithSessionCookie])
+// or OAuth — and an anonymous client is rejected before any request is made.
+// Results come back in Reddit's own order (roughly by subscriber count). At most
+// [mySubredditsMaxPages] pages are fetched.
+func (c *Client) MySubreddits(ctx context.Context) ([]SubredditInfo, error) {
+	if c.sessionCookie == "" && c.auth == nil {
+		return nil, &APIError{Status: "authentication required: connect a Reddit account first"}
+	}
+	var out []SubredditInfo
+	after := ""
+	for page := 0; page < mySubredditsMaxPages; page++ {
+		v := url.Values{}
+		v.Set("limit", "100")
+		if after != "" {
+			v.Set("after", after)
+		}
+		var lr subredditListing
+		if err := c.get(ctx, "/subreddits/mine/subscriber.json?"+v.Encode(), &lr); err != nil {
+			return nil, err
+		}
+		for _, ch := range lr.Data.Children {
+			if ch.Kind != "t5" {
+				continue
+			}
+			out = append(out, ch.info())
+		}
+		if lr.Data.After == "" {
+			break
+		}
+		after = lr.Data.After
+	}
+	return out, nil
 }
