@@ -5,10 +5,20 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+// TestMain installs instant timing for the whole suite so the request pacer
+// (see ratelimit.go) never sleeps through real wall-clock intervals during
+// tests. Rate-limit behaviour itself is asserted directly against a limiter with
+// its own fake clock in ratelimit_test.go, unaffected by this global override.
+func TestMain(m *testing.M) {
+	timeSleep = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
+	os.Exit(m.Run())
+}
 
 // newTestClient spins up an httptest server whose handler is h and returns a
 // Client pointed at it.
