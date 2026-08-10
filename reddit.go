@@ -47,6 +47,11 @@ type Client struct {
 	// logged-in reddit_session cookie. When non-empty it authenticates reads in
 	// place of OAuth (see [WithSessionCookie]); it takes precedence over auth.
 	sessionCookie string
+
+	// limiter paces outbound requests so aggregating many subscriptions stays
+	// under Reddit's budget instead of tripping 429s. Always non-nil (NewClient
+	// installs a default); [WithRateLimit] tunes the rate.
+	limiter *limiter
 }
 
 // Option customises a [Client] at construction time.
@@ -84,14 +89,26 @@ func WithBaseURL(base string) Option {
 	}
 }
 
+// WithRateLimit paces the client to at most perMinute requests, so aggregating
+// many subscriptions (or paging an infinite scroll) glides under Reddit's budget
+// instead of tripping 429 "Too Many Requests". The client further adapts to the
+// X-Ratelimit headers Reddit returns and honours a 429's Retry-After. A
+// perMinute <= 0 restores [DefaultRequestsPerMinute].
+func WithRateLimit(perMinute int) Option {
+	return func(c *Client) {
+		c.limiter = newLimiter(perMinute)
+	}
+}
+
 // NewClient returns a Client with sensible defaults (a 30-second HTTP
-// timeout, the canonical base URL, and [DefaultUserAgent]), then applies each
-// Option in order.
+// timeout, the canonical base URL, [DefaultUserAgent], and a
+// [DefaultRequestsPerMinute] rate limiter), then applies each Option in order.
 func NewClient(opts ...Option) *Client {
 	c := &Client{
 		httpc:     &http.Client{Timeout: 30 * time.Second},
 		baseURL:   DefaultBaseURL,
 		userAgent: DefaultUserAgent,
+		limiter:   newLimiter(DefaultRequestsPerMinute),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -119,9 +136,67 @@ func (e *APIError) Error() string {
 // decodes the JSON body into v, and translates transport/status failures into
 // typed errors. path must begin with "/".
 func (c *Client) get(ctx context.Context, path string, v any) error {
+	// Each attempt waits its turn on the shared limiter, then sends. A 429/503
+	// (Reddit's rate-limit responses) is retried after the server's Retry-After
+	// (or an exponential backoff); every other outcome returns immediately. The
+	// limiter also adapts to the X-Ratelimit headers on each response.
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if err := c.limiter.wait(ctx); err != nil {
+			return err
+		}
+		resp, err := c.doOnce(ctx, path)
+		if err != nil {
+			return err
+		}
+		c.limiter.observe(resp.header)
+		if resp.status == http.StatusTooManyRequests || resp.status == http.StatusServiceUnavailable {
+			lastErr = &APIError{StatusCode: resp.status, Status: resp.statusText, Body: snippet(resp.body)}
+			if attempt == maxRetries {
+				break
+			}
+			c.limiter.pauseFor(c.backoff(resp.header, attempt))
+			continue
+		}
+		if resp.status < 200 || resp.status >= 300 {
+			return &APIError{StatusCode: resp.status, Status: resp.statusText, Body: snippet(resp.body)}
+		}
+		body := resp.body
+		if err := json.Unmarshal(body, v); err != nil {
+			return fmt.Errorf("reddit: decode %s: %w", path, err)
+		}
+		return nil
+	}
+	return lastErr
+}
+
+// backoff picks how long to wait before retrying a rate-limited request: the
+// server's Retry-After when present, otherwise an exponential 1s, 2s, 4s, …
+// escalation keyed to the attempt number.
+func (c *Client) backoff(hdr http.Header, attempt int) time.Duration {
+	if d, ok := c.limiter.retryAfter(hdr); ok {
+		return d
+	}
+	return time.Second << attempt
+}
+
+// rawResponse is one HTTP round-trip's outcome: the status code + line, the
+// response headers (for rate-limit adaptation), and the length-capped body.
+type rawResponse struct {
+	status     int
+	statusText string
+	header     http.Header
+	body       []byte
+}
+
+// doOnce sends a single GET (building the request fresh so a retry re-applies a
+// possibly-refreshed auth token) and returns the round-trip. A transport error
+// or a token-refresh failure is returned as err; an HTTP error status is not
+// (the caller inspects the status).
+func (c *Client) doOnce(ctx context.Context, path string) (*rawResponse, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
 	if err != nil {
-		return fmt.Errorf("reddit: build request: %w", err)
+		return nil, fmt.Errorf("reddit: build request: %w", err)
 	}
 	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Accept", "application/json")
@@ -134,14 +209,14 @@ func (c *Client) get(ctx context.Context, path string, v any) error {
 	case c.auth != nil:
 		tok, err := c.auth.ensureToken(ctx, c)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 
 	resp, err := c.httpc.Do(req)
 	if err != nil {
-		return fmt.Errorf("reddit: request %s: %w", path, err)
+		return nil, fmt.Errorf("reddit: request %s: %w", path, err)
 	}
 	defer resp.Body.Close()
 
@@ -149,19 +224,9 @@ func (c *Client) get(ctx context.Context, path string, v any) error {
 	// memory; 8 MiB comfortably covers the largest real listing pages.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return fmt.Errorf("reddit: read body %s: %w", path, err)
+		return nil, fmt.Errorf("reddit: read body %s: %w", path, err)
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &APIError{
-			StatusCode: resp.StatusCode,
-			Status:     resp.Status,
-			Body:       snippet(body),
-		}
-	}
-	if err := json.Unmarshal(body, v); err != nil {
-		return fmt.Errorf("reddit: decode %s: %w", path, err)
-	}
-	return nil
+	return &rawResponse{status: resp.StatusCode, statusText: resp.Status, header: resp.Header, body: body}, nil
 }
 
 // snippet returns a single-line, length-bounded view of an error body so
