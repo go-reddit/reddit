@@ -86,3 +86,72 @@ func TestSearchSubredditsPropagatesError(t *testing.T) {
 		t.Fatal("want error on 403")
 	}
 }
+
+func TestMySubreddits(t *testing.T) {
+	// Two pages: the first carries an After cursor, the second exhausts it. The
+	// t3 child is skipped, and the second request must echo the cursor back.
+	page1 := `{"data":{"after":"t5_next","children":[
+	  {"kind":"t5","data":{"display_name":"golang","subscribers":300000,"url":"/r/golang/","subreddit_type":"public"}},
+	  {"kind":"t3","data":{"title":"not a subreddit"}}
+	]}}`
+	page2 := `{"data":{"after":null,"children":[
+	  {"kind":"t5","data":{"display_name":"rust","subscribers":250000,"url":"/r/rust/","subreddit_type":"public"}}
+	]}}`
+	calls := 0
+	srv := newRawServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/subreddits/mine/subscriber.json" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if r.URL.Query().Get("limit") != "100" {
+			t.Errorf("limit = %q, want 100", r.URL.Query().Get("limit"))
+		}
+		if r.Header.Get("Cookie") == "" {
+			t.Error("authenticated request must carry the session Cookie")
+		}
+		calls++
+		if calls == 1 {
+			if r.URL.Query().Get("after") != "" {
+				t.Errorf("first page must send no after, got %q", r.URL.Query().Get("after"))
+			}
+			_, _ = w.Write([]byte(page1))
+			return
+		}
+		if r.URL.Query().Get("after") != "t5_next" {
+			t.Errorf("second page after = %q, want t5_next", r.URL.Query().Get("after"))
+		}
+		_, _ = w.Write([]byte(page2))
+	}))
+	c := NewClient(WithBaseURL(srv), WithUserAgent("test/1.0"), WithSessionCookie("sess"))
+
+	subs, err := c.MySubreddits(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2 (paginated)", calls)
+	}
+	if len(subs) != 2 || subs[0].Name != "golang" || subs[1].Name != "rust" {
+		t.Fatalf("subs = %+v, want [golang rust]", subs)
+	}
+	if subs[0].URL != "/r/golang/" || subs[0].Subscribers != 300000 {
+		t.Errorf("golang mapping wrong: %+v", subs[0])
+	}
+}
+
+func TestMySubredditsRequiresAuth(t *testing.T) {
+	// An anonymous client is rejected before any request is made.
+	_, err := NewClient().MySubreddits(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "authentication required") {
+		t.Fatalf("want authentication-required error, got %v", err)
+	}
+}
+
+func TestMySubredditsPropagatesError(t *testing.T) {
+	srv := newRawServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	c := NewClient(WithBaseURL(srv), WithUserAgent("test/1.0"), WithSessionCookie("sess"))
+	if _, err := c.MySubreddits(context.Background()); err == nil {
+		t.Fatal("want error on 403")
+	}
+}
